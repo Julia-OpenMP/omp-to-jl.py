@@ -1,0 +1,382 @@
+"""Julia backend: emit the spec model as Julia source files.
+
+The emitted code only *constructs* values of the types declared by the hand-written
+``Schema`` module of the target package (``OMP.Frontend.Schema`` in OMP.jl), through their
+keyword constructors; the parsing/validation logic lives in hand-written code as well.
+
+Layout of the output directory (one Julia module per kind of spec entity)::
+
+    Spec.jl                 module Spec: provenance, registries, includes the files below
+    modifiers.jl            baremodule Spec.Modifiers        global modifiers
+    modifier_groups.jl      baremodule Spec.ModifierGroups
+    clauses.jl              baremodule Spec.Clauses          one constant per clause
+    clause_groups.jl        baremodule Spec.ClauseGroups
+    directives.jl           baremodule Spec.Directives       one constant per directive
+    compound_directives.jl  Spec.COMPOUND_DIRECTIVES
+
+The entity modules are ``baremodule``s so that constants named after clauses or directives
+(``map``, ``filter``, ``reverse``, ...) do not clash with ``Base``.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
+from . import __version__
+from .model import Argument, Clause, ClauseGroup, Directive, MemberSet, Modifier, ModifierGroup, Spec
+
+WIDTH = 92
+INDENT = "    "
+
+# Julia reserved words: they cannot be used as plain identifiers (use var"...") nor as `:sym`.
+RESERVED = {
+    "baremodule", "begin", "break", "catch", "const", "continue", "do", "else", "elseif", "end",
+    "export", "false", "finally", "for", "function", "global", "if", "import", "let", "local",
+    "macro", "module", "public", "quote", "return", "struct", "true", "try", "using", "while",
+    "abstract", "mutable", "primitive", "type", "where", "in", "isa", "outer",
+}  # fmt: skip
+
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_!]*$")
+
+
+def jl_id(name: str) -> str:
+    """Spec name -> Julia identifier: 'task-dependence-type' -> 'task_dependence_type'."""
+    s = re.sub(r"[^0-9A-Za-z_]+", "_", name).strip("_")
+    if not s:
+        raise ValueError(f"cannot make a Julia identifier from {name!r}")
+    return "_" + s if s[0].isdigit() else s
+
+
+def jl_binding(ident: str) -> str:
+    """Identifier as a binding name (constants of the entity modules)."""
+    return f'var"{ident}"' if ident in RESERVED else ident
+
+
+def jl_sym(ident: str) -> str:
+    """Identifier as a Symbol literal."""
+    if _IDENT.match(ident) and ident not in RESERVED:
+        return ":" + ident
+    return f"Symbol({jl_str(ident)})"
+
+
+def jl_str(s: str) -> str:
+    s = s.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("\n", "\\n")
+    return f'"{s}"'
+
+
+# -- a minimal pretty-printer for nested constructor calls -------------------------------
+
+
+@dataclass
+class Raw:
+    text: str
+
+
+@dataclass
+class Tup:
+    items: Sequence["Node"]
+
+
+@dataclass
+class Call:
+    func: str
+    args: Sequence["Node"] = ()
+    kwargs: Sequence[Tuple[str, "Node"]] = ()
+    sep: str = ", "  # between positional args and kwargs: "; " for f(x; kw = ...)
+
+
+Node = Union[Raw, Tup, Call]
+
+
+def flat(n: Node) -> str:
+    if isinstance(n, Raw):
+        return n.text
+    if isinstance(n, Tup):
+        if len(n.items) == 1:
+            return f"({flat(n.items[0])},)"
+        return "(" + ", ".join(flat(i) for i in n.items) + ")"
+    args = ", ".join(flat(a) for a in n.args)
+    kws = ", ".join(f"{k} = {flat(v)}" for k, v in n.kwargs)
+    sep = n.sep if args and kws else ""
+    return f"{n.func}({args}{sep}{kws})"
+
+
+def render(n: Node, indent: str = "", lead: int = 0) -> str:
+    """Render ``n`` at the given indentation; ``lead`` is the length of the text already on
+    the current line (before the node)."""
+    s = flat(n)
+    if len(indent) + lead + len(s) <= WIDTH or isinstance(n, Raw):
+        return s
+    inner = indent + INDENT
+    if isinstance(n, Tup):
+        lines = [inner + render(i, inner) + "," for i in n.items]
+        return "(\n" + "\n".join(lines) + "\n" + indent + ")"
+    lines = [inner + render(a, inner) + "," for a in n.args]
+    if n.args and n.kwargs and n.sep == "; ":
+        lines[-1] = lines[-1][:-1] + ";"
+    for k, v in n.kwargs:
+        head = f"{k} = "
+        lines.append(inner + head + render(v, inner, len(head)) + ",")
+    return f"{n.func}(\n" + "\n".join(lines) + "\n" + indent + ")"
+
+
+def syms(xs: Sequence[str]) -> Tup:
+    return Tup([Raw(jl_sym(jl_id(x))) for x in xs])
+
+
+# -- conversion of the model --------------------------------------------------------------
+
+
+class Emitter:
+    def __init__(self, spec: Spec):
+        self.spec = spec
+
+    def header(self, what: str) -> str:
+        rev = f", revision {self.spec.revision}" if self.spec.revision else ""
+        return (
+            f"# {what}\n"
+            f"#\n"
+            f"# GENERATED by omp-generator {__version__} from the OpenMP specification sources\n"
+            f"# (OpenMP {self.spec.version}{rev}). DO NOT EDIT: regenerate instead (see\n"
+            f"# omp-generator.py/README.md). Hand-written code belongs in src/frontend/.\n"
+        )
+
+    # values
+
+    def argument(self, a: Argument) -> Call:
+        kw: List[Tuple[str, Node]] = [("name", Raw(jl_sym(jl_id(a.name))))]
+        if jl_id(a.name) != a.name:
+            kw.append(("spelling", Raw(jl_str(a.name))))
+        kw.append(("kind", Raw(jl_sym(a.kind))))
+        if a.type:
+            kw.append(("type", Raw(jl_str(a.type))))
+        if a.keyword:
+            kw.append(("keyword", Raw(jl_sym(jl_id(a.keyword)))))
+        if a.values:
+            # keyword values are spelled as-is (they are OpenMP keywords)
+            kw.append(("values", Tup([Raw(jl_sym(v)) for v in a.values])))
+        if a.items is not None:
+            kw.append(("items", self.argument(a.items)))
+        if a.arguments:
+            kw.append(("arguments", Tup([self.argument(x) for x in a.arguments])))
+        if a.properties:
+            kw.append(("properties", syms(a.properties)))
+        return Call("ArgumentSpec", kwargs=kw)
+
+    def modifier(self, m: Modifier, base: Optional[Modifier] = None) -> Node:
+        """A modifier; when ``base`` (the global modifier m refers to) is given, emit a
+        reference to the Modifiers module, overriding what differs."""
+        if base is not None and base.value == m.value:
+            over: List[Tuple[str, Node]] = []
+            if m.modifying != base.modifying:
+                over.append(("modifying", syms(m.modifying)))
+            if m.properties != base.properties:
+                over.append(("properties", syms(m.properties)))
+            ref = Raw("Modifiers." + jl_binding(jl_id(base.name)))
+            return Call("ModifierSpec", args=[ref], kwargs=over, sep="; ") if over else ref
+        kw: List[Tuple[str, Node]] = [("name", Raw(jl_sym(jl_id(m.name))))]
+        if jl_id(m.name) != m.name:
+            kw.append(("spelling", Raw(jl_str(m.name))))
+        kw.append(("value", self.argument(m.value)))
+        if m.modifying:
+            kw.append(("modifying", syms(m.modifying)))
+        if m.properties:
+            kw.append(("properties", syms(m.properties)))
+        return Call("ModifierSpec", kwargs=kw)
+
+    def clause_modifier(self, m: Modifier) -> Node:
+        return self.modifier(m, self.spec.modifiers.get(m.reference) if m.reference else None)
+
+    def member_set(self, func: str, s: MemberSet) -> Call:
+        kw: List[Tuple[str, Node]] = [("name", Raw(jl_sym(jl_id(s.name)))), ("members", syms(s.members))]
+        if s.properties:
+            kw.append(("properties", syms(s.properties)))
+        return Call(func, kwargs=kw)
+
+    # entities
+
+    def clause(self, c: Clause) -> Call:
+        kw: List[Tuple[str, Node]] = [
+            ("name", Raw(jl_sym(jl_id(c.name)))),
+            ("spelling", Raw(jl_sym(c.spelling))),
+        ]
+        if c.arguments:
+            kw.append(("arguments", Tup([self.argument(a) for a in c.arguments])))
+        if c.modifiers:
+            kw.append(("modifiers", Tup([self.clause_modifier(m) for m in c.modifiers])))
+        if c.modifier_sets:
+            kw.append(("modifier_sets", Tup([self.member_set("ModifierSet", s) for s in c.modifier_sets])))
+        kw.append(("directives", syms(c.directives)))
+        if c.properties:
+            kw.append(("properties", syms(c.properties)))
+        return Call("ClauseSpec", kwargs=kw)
+
+    def clause_group(self, g: ClauseGroup) -> Call:
+        kw: List[Tuple[str, Node]] = [("name", Raw(jl_sym(jl_id(g.name))))]
+        if g.clauses:
+            kw.append(("clauses", syms(g.clauses)))
+        if g.member_property:
+            kw.append(("member_property", Raw(jl_sym(jl_id(g.member_property)))))
+        kw.append(("directives", syms(g.directives)))
+        if g.arguments:
+            kw.append(("arguments", Tup([self.argument(a) for a in g.arguments])))
+        if g.modifiers:
+            kw.append(("modifiers", Tup([self.clause_modifier(m) for m in g.modifiers])))
+        if g.properties:
+            kw.append(("properties", syms(g.properties)))
+        return Call("ClauseGroupSpec", kwargs=kw)
+
+    def modifier_group(self, g: ModifierGroup) -> Call:
+        kw: List[Tuple[str, Node]] = [
+            ("name", Raw(jl_sym(jl_id(g.name)))),
+            ("modifiers", syms(g.modifiers)),
+            ("clauses", syms(g.clauses)),
+        ]
+        if g.properties:
+            kw.append(("properties", syms(g.properties)))
+        return Call("ModifierGroupSpec", kwargs=kw)
+
+    def directive(self, d: Directive) -> Call:
+        kw: List[Tuple[str, Node]] = [
+            ("name", Raw(jl_sym(jl_id(d.name)))),
+            ("spelling", Raw(jl_sym(d.spelling))),
+            ("category", Raw(jl_sym(jl_id(d.category)))),
+            ("association", Raw(jl_sym(jl_id(d.association)))),
+        ]
+        if d.association_properties:
+            kw.append(("association_properties", syms(d.association_properties)))
+        if d.language != "any":
+            kw.append(("language", Raw(jl_sym(jl_id(d.language)))))
+        if d.arguments:
+            kw.append(("arguments", Tup([self.argument(a) for a in d.arguments])))
+        if d.clauses:
+            kw.append(("clauses", syms(d.clauses)))
+        if d.clause_groups:
+            kw.append(("clause_groups", syms(d.clause_groups)))
+        if d.clause_sets:
+            kw.append(("clause_sets", Tup([self.member_set("ClauseSet", s) for s in d.clause_sets])))
+        if d.properties:
+            kw.append(("properties", syms(d.properties)))
+        for k in ("separating", "separated", "subsidiary", "enclosing"):
+            if getattr(d, k):
+                kw.append((k, syms(getattr(d, k))))
+        return Call("DirectiveSpec", kwargs=kw)
+
+    # files
+
+    def entity_module(self, module: str, doc: str, imports: Sequence[str], entities: Dict[str, Node]) -> str:
+        out = [self.header(f"Spec.{module}"), f'"""\n    Spec.{module}\n\n{doc}\n"""', f"baremodule {module}", ""]
+        out.append("using ..Schema")
+        out.extend(f"import ..{m}" for m in imports)
+        for name, node in entities.items():
+            binding = jl_binding(jl_id(name))
+            head = f"const {binding} = "
+            out.append("")
+            out.append(head + render(node, "", len(head)))
+        out += ["", f"end # baremodule {module}", ""]
+        return "\n".join(out)
+
+    def registry(self, module: str, names: Sequence[str]) -> str:
+        items = ",\n".join(f"{INDENT}{module}.{jl_binding(jl_id(n))}" for n in names)
+        return f"(\n{items},\n)"
+
+    def files(self) -> Dict[str, str]:
+        s = self.spec
+        files: Dict[str, str] = {}
+
+        files["modifiers.jl"] = self.entity_module(
+            "Modifiers",
+            "Modifiers defined by the specification, one constant per modifier.",
+            [],
+            {n: self.modifier(m) for n, m in sorted(s.modifiers.items())},
+        )
+        files["modifier_groups.jl"] = self.entity_module(
+            "ModifierGroups",
+            "Modifier groups, one constant per group.",
+            [],
+            {n: self.modifier_group(g) for n, g in sorted(s.modifier_groups.items())},
+        )
+        files["clauses.jl"] = self.entity_module(
+            "Clauses",
+            "Clauses, one constant per clause (named after the clause).",
+            ["Modifiers"],
+            {n: self.clause(c) for n, c in sorted(s.clauses.items())},
+        )
+        files["clause_groups.jl"] = self.entity_module(
+            "ClauseGroups",
+            "Clause groups, one constant per group.",
+            ["Modifiers"],
+            {n: self.clause_group(g) for n, g in sorted(s.clause_groups.items())},
+        )
+        files["directives.jl"] = self.entity_module(
+            "Directives",
+            "Leaf directives, one constant per directive (named after the directive).",
+            [],
+            {n: self.directive(d) for n, d in sorted(s.directives.items())},
+        )
+
+        compounds = "".join(f"{INDENT}{flat(Tup([Raw(jl_sym(x)) for x in c]))},\n" for c in s.compound_directives)
+        files["compound_directives.jl"] = (
+            self.header("Spec.COMPOUND_DIRECTIVES")
+            + '"""\n    COMPOUND_DIRECTIVES\n\nAll compound directives, as tuples of leaf directive spellings (outermost first).\n"""\n'
+            + f"const COMPOUND_DIRECTIVES = Tuple{{Vararg{{Symbol}}}}[\n{compounds}]\n"
+        )
+
+        rev = jl_str(s.revision) if s.revision else "nothing"
+        files["Spec.jl"] = "\n".join(
+            [
+                self.header("Spec: the OpenMP directive syntax, as data").rstrip("\n"),
+                '"""',
+                "    Spec",
+                "",
+                "Specifications of the OpenMP directives, clauses and modifiers, generated from the",
+                "OpenMP specification sources. Each kind of entity has its own module",
+                "(`Directives`, `Clauses`, `ClauseGroups`, `Modifiers`, `ModifierGroups`), holding",
+                "one constant per entity; the tuples below list them all.",
+                '"""',
+                "module Spec",
+                "",
+                "import ..Schema",
+                "using .Schema",
+                "",
+                '"OpenMP version of the specification sources this module was generated from."',
+                f"const OPENMP_VERSION = {jl_str(s.version)}",
+                '"Revision of the specification sources this module was generated from, if known."',
+                f"const SPEC_REVISION = {rev}",
+                '"Version of omp-generator that generated this module."',
+                f"const GENERATOR_VERSION = {jl_str(__version__)}",
+                "",
+                'include("modifiers.jl")',
+                'include("modifier_groups.jl")',
+                'include("clauses.jl")',
+                'include("clause_groups.jl")',
+                'include("directives.jl")',
+                'include("compound_directives.jl")',
+                "",
+                '"All directive specifications."',
+                f"const DIRECTIVES = {self.registry('Directives', sorted(s.directives))}",
+                "",
+                '"All clause specifications."',
+                f"const CLAUSES = {self.registry('Clauses', sorted(s.clauses))}",
+                "",
+                '"All clause-group specifications."',
+                f"const CLAUSE_GROUPS = {self.registry('ClauseGroups', sorted(s.clause_groups))}",
+                "",
+                '"All (global) modifier specifications."',
+                f"const MODIFIERS = {self.registry('Modifiers', sorted(s.modifiers))}",
+                "",
+                '"All modifier-group specifications."',
+                f"const MODIFIER_GROUPS = {self.registry('ModifierGroups', sorted(s.modifier_groups))}",
+                "",
+                "end # module Spec",
+                "",
+            ]
+        )
+        return files
+
+
+def generate(spec: Spec) -> Dict[str, str]:
+    """Map of file name -> content of the Julia files for ``spec``."""
+    return Emitter(spec).files()
