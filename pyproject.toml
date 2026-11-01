@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omp-generator"
 version = "0.1.0"
-description = "Generate front-end code for OpenMP directives from the OpenMP specification sources"
+description = "Generate the OpenMP support of OMP.jl (directives) and omp-abi (API routines) from the OpenMP specification sources"
 readme = "README.md"
 license = { text = "BSD-3-Clause" }
 authors = [{ name = "Romain PEREIRA", email = "rpereira@anl.gov" }]
