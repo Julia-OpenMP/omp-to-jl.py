@@ -1,26 +1,9 @@
-"""Load the OpenMP API routines and types (the C interface of ``omp.h``) from the
-specification sources.
+"""Load the OpenMP API routines and types (``omp.h``) from the specification sources:
+``json/routine/omp_*.json``, ``json/typedef/*.json``, and ``appendices/omp.h``, which is only
+cross-checked, plus the source of what the JSON lacks (constants of anonymous enumerations,
+enumerators of implementation-defined enumerations).
 
-Inputs, relative to the root of the specification sources:
-
-* ``json/routine/omp_*.json``: the API routines (the ``ompd_*`` / ``ompt_*`` tool
-  interfaces are not part of the user API and are ignored);
-* ``json/typedef/*.json``: the API types (``sched`` -> ``omp_sched_t``, ...);
-* ``appendices/omp.h``: the example C header. It is only a cross-check of the routine and
-  enumeration definitions read from the JSON, plus the source of what the JSON does not
-  describe: the constants of its anonymous enumerations (e.g. ``omp_initial_device``), and
-  the enumerators of the enumerations that the JSON leaves to the implementation (e.g. the
-  ``omp_ifr_*`` foreign runtime identifiers, next to ``omp_ifr_last``);
-* ``version.mk``: OpenMP version.
-
-The JSON describes the routines for both C and Fortran (``iso_c``, ``value``,
-``intent(in)``, ...): this module derives their C prototype, :class:`CType` by
-:class:`CType`. As for the directives (:mod:`.spec`), only structural facts are read: names,
-types, values and properties, never prose.
-
-Implementation-defined facts (the lock types, values marked as implementation defined, ...)
-are *not* decided here: they are left to the implementation, omp-abi
-(``include/omp-abi/api-impl.h``, see :mod:`.c_api`).
+The JSON describes C and Fortran (``iso_c``, ``intent(in)``, ...): the C prototypes are derived.
 """
 
 from __future__ import annotations
@@ -38,9 +21,7 @@ from .spec import SpecError, _git_revision, _version
 
 @dataclass(frozen=True)
 class CType:
-    """A C type, as found in a prototype: ``base`` (``int``, ``omp_sched_t``, ...),
-    ``pointer`` levels, and whether the pointee is ``const``. A ``const`` on a value is not
-    recorded: it does not belong to the interface."""
+    """``const`` qualifies the pointee; a ``const`` value is not part of the interface."""
 
     base: str
     pointer: int = 0
@@ -57,8 +38,7 @@ class Parameter:
     type: str  # spec type: "integer", "c_ptr", "sched", ...
     ctype: CType
     properties: Tuple[str, ...] = ()
-    # default value: C++ default argument of the spec, or NULL for an optional pointer.
-    # Either a literal, an identifier (an enumerator), or None
+    # C++ default argument (literal or enumerator), or NULL for an optional pointer
     default: Optional[str] = None
 
     @property
@@ -440,10 +420,8 @@ def _cross_check(api: Api, header: Header, L: Loader):
 
 
 def _merge_enumerators(api: Api, header: Header):
-    """Add the enumerators that only the example header defines to the enumerations that the
-    JSON leaves (partly) to the implementation, i.e. that have an implementation-defined
-    enumerator. Other enumerations are complete in the JSON: the header's extra enumerators
-    are deprecated aliases or typos."""
+    """Add the header-only enumerators of the enumerations having an implementation-defined
+    enumerator; elsewhere, header-only enumerators are deprecated aliases or typos."""
     for name, t in list(api.typedefs.items()):
         if t.kind != ENUMERATION or t.cname not in header.enums:
             continue
